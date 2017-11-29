@@ -56,6 +56,7 @@
 
 #![cfg_attr(feature = "nightly", feature(const_fn))]
 #![cfg_attr(feature = "nightly", feature(alloc))]
+#![cfg_attr(feature = "nightly", feature(attr_literals, repr_align))]
 #![cfg_attr(not(test), no_std)]
 
 #[cfg(all(not(test), feature = "use_std"))]

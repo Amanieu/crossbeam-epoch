@@ -206,6 +206,7 @@ struct LocalList {
 }
 
 /// Participant for garbage collection.
+#[cfg_attr(feature = "nightly", repr(align(128)))]
 pub struct Local {
     /// A flag indicating whether this `Local` is currently in use. An unused
     /// `Local` must have an epoch value of `Epoch::starting()`.
