@@ -17,28 +17,26 @@
 //! Guards are necessary for performing atomic operations, and for freeing/dropping locations.
 
 use core::cell::{Cell, UnsafeCell};
-use core::mem::{self, ManuallyDrop};
+use core::mem;
 use core::num::Wrapping;
 use core::ptr;
 use core::sync::atomic;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use alloc::boxed::Box;
 use alloc::arc::Arc;
 
 use crossbeam_utils::cache_padded::CachePadded;
 
-use atomic::Owned;
 use collector::Handle;
 use epoch::{AtomicEpoch, Epoch};
-use guard::{unprotected, Guard};
+use guard::Guard;
 use garbage::{Bag, Garbage};
-use sync::list::{List, Entry, IterError, IsElement};
 use sync::queue::Queue;
 
 /// The global data for a garbage collector.
 pub struct Global {
     /// The intrusive linked list of `Local`s.
-    locals: List<Local>,
+    locals: AtomicPtr<LocalList>,
 
     /// The global queue of bags of deferred functions.
     queue: Queue<(Epoch, Bag)>,
@@ -55,7 +53,7 @@ impl Global {
     #[inline]
     pub fn new() -> Self {
         Self {
-            locals: List::new(),
+            locals: AtomicPtr::new(ptr::null_mut()),
             queue: Queue::new(),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
         }
@@ -80,7 +78,7 @@ impl Global {
     /// `collect()` is not called.
     #[cold]
     pub fn collect(&self, guard: &Guard) {
-        let global_epoch = self.try_advance(guard);
+        let global_epoch = self.try_advance();
 
         let condition = |item: &(Epoch, Bag)| {
             // A pinned participant can witness at most one epoch advancement. Therefore, any bag
@@ -111,31 +109,22 @@ impl Global {
     ///
     /// `try_advance()` is annotated `#[cold]` because it is rarely called.
     #[cold]
-    pub fn try_advance(&self, guard: &Guard) -> Epoch {
+    pub fn try_advance(&self) -> Epoch {
         let global_epoch = self.epoch.load(Ordering::Relaxed);
         atomic::fence(Ordering::SeqCst);
 
-        // TODO(stjepang): `Local`s are stored in a linked list because linked lists are fairly
-        // easy to implement in a lock-free manner. However, traversal can be slow due to cache
-        // misses and data dependencies. We should experiment with other data structures as well.
-        for local in self.locals.iter(&guard) {
-            match local {
-                Err(IterError::Stalled) => {
-                    // A concurrent thread stalled this iteration. That thread might also try to
-                    // advance the epoch, in which case we leave the job to it. Otherwise, the
-                    // epoch will not be advanced.
+        let mut ptr = self.locals.load(Ordering::Acquire);
+        while let Some(list) = unsafe { ptr.as_ref() } {
+            for local in list.locals.iter() {
+                let local_epoch = local.epoch.load(Ordering::Relaxed);
+
+                // If the participant was pinned in a different epoch, we cannot advance the
+                // global epoch just yet.
+                if local_epoch.is_pinned() && local_epoch.unpinned() != global_epoch {
                     return global_epoch;
                 }
-                Ok(local) => {
-                    let local_epoch = local.epoch.load(Ordering::Relaxed);
-
-                    // If the participant was pinned in a different epoch, we cannot advance the
-                    // global epoch just yet.
-                    if local_epoch.is_pinned() && local_epoch.unpinned() != global_epoch {
-                        return global_epoch;
-                    }
-                }
             }
+            ptr = list.next.load(Ordering::Acquire);
         }
         atomic::fence(Ordering::Acquire);
 
@@ -150,12 +139,77 @@ impl Global {
         self.epoch.store(new_epoch, Ordering::Release);
         new_epoch
     }
+
+    /// Allocates a new `Local`.
+    fn new_local(&self) -> &Local {
+        let mut list_head = self.locals.load(Ordering::Acquire);
+        loop {
+            // Look for an unused `Local` in the linked list.
+            let mut ptr = list_head;
+            while let Some(list) = unsafe { ptr.as_ref() } {
+                for local in list.locals.iter() {
+                    if !local.in_use.load(Ordering::Relaxed) &&
+                       !local.in_use.swap(true, Ordering::Acquire) {
+                        return local;
+                    }
+                }
+                ptr = list.next.load(Ordering::Acquire);
+            }
+
+            // Allocate a new linked list node.
+            let new = Box::new(LocalList::default());
+            new.next.store(list_head, Ordering::Relaxed);
+            new.locals[0].in_use.store(true, Ordering::Relaxed);
+            let new = Box::into_raw(new);
+
+            // Try to insert the new node into the linked list. If this fails
+            // then it means that another thread won a race and added a new
+            // node. If that is the case then we free the our node and try to
+            // find a slot in the newly added node.
+            match self.locals.compare_exchange(list_head, new, Ordering::Release, Ordering::Relaxed) { 
+                Ok(_) => return unsafe { &(*new).locals[0] },
+                Err(x) => {
+                    drop(unsafe { Box::from_raw(new) });
+                    list_head = x;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Global {
+    fn drop(&mut self) {
+        // Free the linked list of `Local`s on drop, since we can't free it
+        // while `Local`s may still be added or removed.
+        let mut ptr = self.locals.load(Ordering::Relaxed);
+        while !ptr.is_null() {
+            unsafe {
+                let next = (*ptr).next.load(Ordering::Relaxed);
+                drop(Box::from_raw(ptr));
+                ptr = next;
+            }
+        }
+    }
+}
+
+/// Number of `Local`s packed in each linked list entry.
+const LOCALS_PER_ENTRY: usize = 32;
+
+/// Linked list node for `Local`s in a `Global`.
+#[derive(Default)]
+struct LocalList {
+    /// A node in the intrusive linked list of `LocalList`s.
+    next: AtomicPtr<LocalList>,
+
+    /// `Local` structs in this entry.
+    locals: [Local; LOCALS_PER_ENTRY],
 }
 
 /// Participant for garbage collection.
 pub struct Local {
-    /// A node in the intrusive linked list of `Local`s.
-    entry: Entry,
+    /// A flag indicating whether this `Local` is currently in use. An unused
+    /// `Local` must have an epoch value of `Epoch::starting()`.
+    in_use: AtomicBool,
 
     /// The local epoch.
     epoch: AtomicEpoch,
@@ -163,7 +217,7 @@ pub struct Local {
     /// A reference to the global data.
     ///
     /// When all guards and handles get dropped, this reference is destroyed.
-    global: UnsafeCell<ManuallyDrop<Arc<Global>>>,
+    global: Cell<*const Global>,
 
     /// The local bag of deferred functions.
     pub(crate) bag: UnsafeCell<Bag>,
@@ -182,6 +236,20 @@ pub struct Local {
 
 unsafe impl Sync for Local {}
 
+impl Default for Local {
+    fn default() -> Self {
+        Local {
+            in_use: AtomicBool::new(false),
+            epoch: AtomicEpoch::new(Epoch::starting()),
+            global: Cell::new(ptr::null()),
+            bag: UnsafeCell::new(Bag::new()),
+            guard_count: Cell::new(0),
+            handle_count: Cell::new(1),
+            pin_count: Cell::new(Wrapping(0)),
+        }
+    }
+}
+
 impl Local {
     /// Number of pinnings after which a participant will execute some deferred functions from the
     /// global queue.
@@ -189,21 +257,10 @@ impl Local {
 
     /// Registers a new `Local` in the provided `Global`.
     pub fn register(global: Arc<Global>) -> Handle {
-        unsafe {
-            // Since we dereference no pointers in this block, it is safe to use `unprotected`.
-
-            let local = Owned::new(Local {
-                entry: Entry::default(),
-                epoch: AtomicEpoch::new(Epoch::starting()),
-                global: UnsafeCell::new(ManuallyDrop::new(global.clone())),
-                bag: UnsafeCell::new(Bag::new()),
-                guard_count: Cell::new(0),
-                handle_count: Cell::new(1),
-                pin_count: Cell::new(Wrapping(0)),
-            }).into_shared(&unprotected());
-            global.locals.insert(local, &unprotected());
-            Handle { local: local.as_raw() }
-        }
+        let local = global.new_local();
+        local.global.set(Arc::into_raw(global.clone()));
+        local.handle_count.set(1);
+        Handle { local }
     }
 
     /// Returns a reference to the `Global` in which this `Local` resides.
@@ -365,34 +422,15 @@ impl Local {
             // Take the reference to the `Global` out of this `Local`. Since we're not protected
             // by a guard at this time, it's crucial that the reference is read before marking the
             // `Local` as deleted.
-            let global: Arc<Global> = ptr::read(&**self.global.get());
+            let global: Arc<Global> = Arc::from_raw(self.global.get());
 
-            // Mark this node in the linked list as deleted.
-            self.entry.delete(&unprotected());
+            // Mark this node in the linked list as free for re-use.
+            self.in_use.store(false, Ordering::Release);
 
             // Finally, drop the reference to the global.  Note that this might be the last
             // reference to the `Global`. If so, the global data will be destroyed and all deferred
             // functions in its queue will be executed.
             drop(global);
         }
-    }
-}
-
-impl IsElement<Local> for Local {
-    fn entry_of(local: &Local) -> &Entry {
-        let entry_ptr = (local as *const Local as usize + offset_of!(Local, entry)) as *const Entry;
-        unsafe { &*entry_ptr }
-    }
-
-    unsafe fn element_of(entry: &Entry) -> &Local {
-        // offset_of! macro uses unsafe, but it's unnecessary in this context.
-        #[allow(unused_unsafe)]
-        let local_ptr = (entry as *const Entry as usize - offset_of!(Local, entry)) as *const Local;
-        &*local_ptr
-    }
-
-    unsafe fn finalize(entry: &Entry) {
-        let local = Self::element_of(entry);
-        drop(Box::from_raw(local as *const Local as *mut Local));
     }
 }
