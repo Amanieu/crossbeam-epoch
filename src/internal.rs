@@ -141,7 +141,7 @@ impl Global {
     }
 
     /// Allocates a new `Local`.
-    fn new_local(&self) -> &Local {
+    fn new_local(&self) -> *const Local {
         let mut list_head = self.locals.load(Ordering::Acquire);
         loop {
             // Look for an unused `Local` in the linked list.
@@ -245,7 +245,7 @@ impl Default for Local {
             global: Cell::new(ptr::null()),
             bag: UnsafeCell::new(Bag::new()),
             guard_count: Cell::new(0),
-            handle_count: Cell::new(1),
+            handle_count: Cell::new(0),
             pin_count: Cell::new(Wrapping(0)),
         }
     }
@@ -259,8 +259,10 @@ impl Local {
     /// Registers a new `Local` in the provided `Global`.
     pub fn register(global: Arc<Global>) -> Handle {
         let local = global.new_local();
-        local.global.set(Arc::into_raw(global.clone()));
-        local.handle_count.set(1);
+        unsafe {
+            (*local).handle_count.set(1);
+            (*local).global.set(Arc::into_raw(global));
+        }
         Handle { local }
     }
 
