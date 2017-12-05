@@ -206,7 +206,8 @@ struct LocalList {
 }
 
 /// Participant for garbage collection.
-#[cfg_attr(feature = "nightly", repr(align(128)))]
+#[cfg_attr(feature = "nightly", repr(align(64)))]
+#[cfg_attr(not(feature = "nightly"), repr(C))]
 pub struct Local {
     /// A flag indicating whether this `Local` is currently in use. An unused
     /// `Local` must have an epoch value of `Epoch::starting()`.
@@ -233,6 +234,12 @@ pub struct Local {
     ///
     /// This is just an auxilliary counter that sometimes kicks off collection.
     pin_count: Cell<Wrapping<usize>>,
+
+    /// Padding so that we don't share a cache line with other `Local`s.
+    #[cfg(feature = "nightly")]
+    _pad: [u64; 0],
+    #[cfg(not(feature = "nightly"))]
+    _pad: [u64; 8],
 }
 
 unsafe impl Sync for Local {}
@@ -247,6 +254,7 @@ impl Default for Local {
             guard_count: Cell::new(0),
             handle_count: Cell::new(0),
             pin_count: Cell::new(Wrapping(0)),
+            _pad: Default::default(),
         }
     }
 }
